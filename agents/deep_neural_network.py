@@ -70,17 +70,11 @@ class DeepNeuralNetworkInference:
 
         np.random.seed(42)
         torch.manual_seed(42)
-        torch.cuda.manual_seed(42)
 
     def setup(self):
         self.vectorizer = HashingVectorizer(n_features=5000, stop_words="english", binary=True)
         self.model = DeepNeuralNetwork(5000)
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device("cpu")
 
         logging.info(f"Neural Network is using {self.device}")
 

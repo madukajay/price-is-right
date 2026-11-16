@@ -1,70 +1,104 @@
-# Pricing Agent
+# The Price is Right
 
-Estimates what a product should cost, then hunts RSS deal feeds for items priced well below that estimate.
+A local agent framework that reads DealNews RSS feeds, estimates what each product should cost, and sends a Pushover alert when the discount is larger than $50.
 
-A fine-tuned Llama 3.2 3B model runs on [Modal](https://modal.com) and prices a product description. A local agent framework scans deals, combines that specialist model with a frontier model and a neural network, and sends a Pushover alert when the discount is large enough.
+`price_is_right.py` is the Gradio UI. `deal_agent_framework.py` runs the same planning cycle once from the command line. Both call `PlanningAgent`, which coordinates the other agents in a fixed order.
 
-## How it works
+## Agent call flow
 
-The planner runs three steps:
+On startup the framework opens the Chroma collection `products` in `products_vectorstore` and loads past opportunities from `memory.json`. Agents are created on the first run, then reused.
 
-1. **Scanner** reads deal RSS feeds and asks a frontier model to keep the five listings with a clear price and a detailed description.
-2. **Ensemble** rewrites the description, then blends three estimates: the Modal specialist (weight 0.1), a RAG frontier model over a Chroma product store (0.8), and a local deep neural network (0.1).
-3. **Messenger** writes a short alert with Claude and pushes it through Pushover when the discount is greater than $50.
+```mermaid
+flowchart TD
+    start["price_is_right.py or deal_agent_framework.py"] --> framework["DealAgentFramework.run"]
+    framework --> plan["PlanningAgent.plan"]
 
-`price_is_right.py` wraps the same loop in a Gradio UI that logs each run, lists opportunities, and plots the product vector store.
+    plan --> scan["ScannerAgent.scan"]
+    scan --> rss["Fetch DealNews RSS: Electronics, Computers, Smart Home"]
+    rss --> skip["Drop URLs already stored in memory.json"]
+    skip --> pick["gpt-6-luna structured output: keep up to 5 deals with a clear price"]
 
-## Layout
+    pick --> each["For each selected deal"]
+    each --> ensemble["EnsembleAgent.price"]
+    ensemble --> prep["Preprocessor rewrites the description via LiteLLM"]
+    prep --> specialist["SpecialistAgent: Modal app pricer-service, class Pricer"]
+    specialist --> frontier["FrontierAgent"]
+    frontier --> embed["Encode with all-MiniLM-L6-v2"]
+    embed --> chroma["Query Chroma for 5 similar products"]
+    chroma --> gpt["gpt-5.1 estimates the price from that context"]
+    gpt --> neural["NeuralNetworkAgent on CPU"]
+    neural --> blend["Blend: 0.8 frontier + 0.1 specialist + 0.1 neural net"]
+    blend --> discount["discount = estimate − listed price"]
 
-| File | What it does |
-|---|---|
-| `hello.py` | Small Modal function that reports where the container is running |
-| `llama.py` | Loads base Llama 3.2 3B on a T4 and generates a short completion |
-| `pricer_ephemeral.py` | Prices one description remotely; the model loads on every call |
-| `pricer_service.py` | Same pricer as a Modal function |
-| `pricer_service2.py` | Deployed `Pricer` class that keeps the model warm and caches Hugging Face weights |
-| `pricer_test.py` | Calls the deployed `pricer-service` app |
-| `deal_agent_framework.py` | Runs one planning cycle and stores opportunities in `memory.json` |
-| `price_is_right.py` | Gradio app, "The Price is Right" |
-| `agents/` | Scanner, ensemble, specialist, frontier, neural network, messenger, and planner |
+    discount --> best["Keep the deal with the largest discount"]
+    best --> gate{"discount > $50?"}
+    gate -->|yes| alert["MessagingAgent.alert sends Pushover"]
+    alert --> save["Append the opportunity to memory.json"]
+    gate -->|no| done["Return nothing and leave memory unchanged"]
+```
 
-The specialist calls the deployed class by name: Modal app `pricer-service`, class `Pricer`. The weights are the LoRA adapter `ed-donner/price-2025-11-28_18.47.07` on `meta-llama/Llama-3.2-3B`, loaded in 4-bit on a T4.
+The three pricers run one after another on the rewritten description. The ensemble waits for all three numbers, then returns the weighted sum. The planner prices at most five deals, sorts them by discount, and alerts only for the winner when that discount is greater than $50.
+
+The Gradio app starts a run as soon as the page loads, then repeats it every 5 minutes. Clicking a row in the deals table calls `MessagingAgent.alert` again for that opportunity. The 3D plot is separate from this loop: at startup it reads embeddings from the same Chroma collection and draws them with t-SNE.
+
+## What each agent does
+
+| Agent | Called by | What it does |
+|---|---|---|
+| Planning Agent | `DealAgentFramework` | Runs scan, then price, then alert. Threshold is $50. |
+| Scanner Agent | Planning Agent | Scrapes DealNews and asks `gpt-6-luna` for the five clearest deals. |
+| Ensemble Agent | Planning Agent, once per deal | Rewrites the description and blends the three price estimates. |
+| Preprocessor | Ensemble Agent | Rewrites the listing into title, category, brand, description, and details. Default model is `openai/gpt-6-luna`. |
+| Specialist Agent | Ensemble Agent | Calls the deployed Modal class `Pricer` on the app `pricer-service`. Weight 0.1. |
+| Frontier Agent | Ensemble Agent | Retrieves five similar products from Chroma, then asks `gpt-5.1` for a price. Weight 0.8. |
+| Neural Network Agent | Ensemble Agent | Runs the local deep network in `deep_neural_network.pth` on CPU. Weight 0.1. |
+| Messaging Agent | Planning Agent, and a table click in the UI | Pushes a short deal alert through Pushover. |
+
+## Autonomous planner
+
+`agents/autonomous_planning_agent.py` is a second planner. It is not what the UI or `deal_agent_framework.py` calls. A `gpt-5.1` tool loop decides the order itself:
+
+```mermaid
+flowchart TD
+    llm["gpt-5.1 with tools"] --> scanTool["scan_the_internet_for_bargains → ScannerAgent"]
+    scanTool --> llm
+    llm --> priceTool["estimate_true_value → EnsembleAgent.price"]
+    priceTool --> llm
+    llm --> notifyTool["notify_user_of_deal, once"]
+    notifyTool --> claude["MessagingAgent.notify asks Claude for a 2–3 sentence alert"]
+    claude --> push["Pushover"]
+```
+
+`MessagingAgent.alert` is the fixed planner's path and does not call Claude. `MessagingAgent.notify` is only used by this autonomous planner.
 
 ## Setup
 
-Install the Python packages the scripts import (`modal`, `python-dotenv`, `torch`, `transformers`, `peft`, `bitsandbytes`, `accelerate`, `openai`, `litellm`, `chromadb`, `gradio`, `plotly`, `scikit-learn`, `sentence-transformers`, `feedparser`, `beautifulsoup4`, `pydantic`, `requests`). Authenticate the Modal CLI (`modal setup`).
+The Chroma collection has to already contain product documents and embeddings. Opening the app creates an empty `products` collection if the folder is missing, and the plot cannot run t-SNE on zero vectors. The frontier agent also needs those vectors to retrieve similar products.
 
-Create a Modal secret named `huggingface-secret` with a Hugging Face token that can read Llama 3.2.
+The neural network loads `deep_neural_network.pth` onto CPU.
 
-Put local keys in a `.env` file:
+Put keys in `.env`:
 
 ```
 OPENAI_API_KEY=
 PUSHOVER_USER=
 PUSHOVER_TOKEN=
-PRICER_PREPROCESSOR_MODEL=ollama/llama3.2
 ```
 
-`PRICER_PREPROCESSOR_MODEL` is optional. The preprocessor defaults to Ollama at `http://localhost:11434`. The neural network agent loads weights from `deep_neural_network.pth`, and the frontier agent reads a Chroma database at `products_vectorstore`.
+`PRICER_PREPROCESSOR_MODEL` overrides the preprocessor model. The specialist agent expects a deployed Modal app named `pricer-service` with a class named `Pricer`.
+
+Install the packages the scripts import: `modal`, `python-dotenv`, `torch`, `openai`, `litellm`, `chromadb`, `gradio`, `plotly`, `scikit-learn`, `sentence-transformers`, `feedparser`, `beautifulsoup4`, `pydantic`, and `requests`.
 
 ## Run
 
+One planning cycle:
+
 ```bash
-modal run hello.py
-modal run llama.py
-modal run pricer_ephemeral.py
+uv run deal_agent_framework.py
 ```
 
-Deploy the warm pricer, then call it:
+Gradio UI, in the browser, repeating every 5 minutes:
 
 ```bash
-modal deploy pricer_service2.py
-modal run pricer_test.py
-```
-
-Run the deal agent once, or open the UI (it also reruns every 5 minutes):
-
-```bash
-python deal_agent_framework.py
-python price_is_right.py
+uv run price_is_right.py
 ```

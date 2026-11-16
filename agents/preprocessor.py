@@ -4,8 +4,13 @@ import os
 
 load_dotenv(override=True)
 
-DEFAULT_MODEL_NAME = os.getenv("PRICER_PREPROCESSOR_MODEL", "ollama/llama3.2")
-DEFAULT_REASONING_EFFORT = "low" if "gpt-oss" in DEFAULT_MODEL_NAME else None
+DEFAULT_MODEL_NAME = os.getenv("PRICER_PREPROCESSOR_MODEL", "openai/gpt-6-luna")
+if "gpt-oss" in DEFAULT_MODEL_NAME:
+    DEFAULT_REASONING_EFFORT = "low"
+elif "gpt-6" in DEFAULT_MODEL_NAME:
+    DEFAULT_REASONING_EFFORT = "none"
+else:
+    DEFAULT_REASONING_EFFORT = None
 
 SYSTEM_PROMPT = """Create a concise description of a product. Respond only in this format. Do not include part numbers.
 Title: Rewritten short precise title
@@ -28,8 +33,6 @@ class Preprocessor:
         self.model_name = model_name
         self.reasoning_effort = reasoning_effort
         self.base_url = base_url
-        if "ollama" in model_name and not base_url:
-            self.base_url = "http://localhost:11434"
 
     def messages_for(self, text: str) -> list[dict]:
         return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]

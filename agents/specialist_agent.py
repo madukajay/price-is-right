@@ -1,7 +1,6 @@
 import modal
 from agents.agent import Agent
 
-
 class SpecialistAgent(Agent):
     """
     An Agent that runs our fine-tuned LLM that's running remotely on Modal
